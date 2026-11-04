@@ -299,11 +299,12 @@ function updateFlag(t) {
   for (let i = 0; i < p.length; i += 3) {
     const bx = flagBase[i], by = flagBase[i + 1];
     const u = (bx + FLAG_W / 2) / FLAG_W;               // 0 at hoist (rotated: texture left at +x before rotation)
-    const d = 1 - u;                                      // distance from pole after the PI rotation
-    const amp = d * 0.38;
-    p[i + 2] = Math.sin(d * 7.5 - t * 9.0 + by * 0.6) * amp + Math.sin(d * 13 - t * 14) * amp * 0.25;
-    p[i] = bx + d * d * 0.08 * Math.sin(t * 6);
-    p[i + 1] = by - d * d * 0.12;
+    const d = u;                                          // 0 at the pole (hoist), 1 at the free end
+    const amp = 0.08 + d * 0.62;
+    const w1 = Math.sin(d * 6.5 - t * 8.0 + by * 0.5);
+    p[i + 2] = w1 * amp + Math.sin(d * 12 - t * 13 + by) * amp * 0.25;
+    p[i] = bx + d * (0.1 * Math.cos(d * 6.5 - t * 8.0)) - d * d * 0.25 * (0.5 + 0.5 * w1);
+    p[i + 1] = by - d * d * 0.18 + Math.sin(d * 5 - t * 7) * d * 0.12;
   }
   flagGeo.attributes.position.needsUpdate = true;
   flagGeo.computeVertexNormals();
@@ -461,18 +462,19 @@ window.renderFrame = function (t) {
   const p1 = new THREE.Vector3(sx - 15.5 - 0.35 * t, 1.3 + Math.sin(t * 1.1) * 0.22 + hy * 0.12, 42);
   const l1 = new THREE.Vector3(sx - 15 - 0.35 * t, 6.2 + hy * 0.1, 0);
   // shot 2: drift up & away, turn to the moon, then push into its reflection
-  const camTop = new THREE.Vector3(sx - 2, 16, 52);
+  const camTop = new THREE.Vector3(sx + 24, 16, 58);
   const reflAt = camTop.clone().add(new THREE.Vector3(MOON_DIR.x, 0, MOON_DIR.z).normalize().multiplyScalar(62));
   reflAt.y = 0;
   const moonLook = camTop.clone().add(MOON_DIR.clone().multiplyScalar(300));
   if (t < 3.0) {
     pos = p1; look = l1; fov = 62;
   } else {
-    const a = ease(seg(t, 3.0, 4.6));            // rise and turn to the moon
+    const a = ease(seg(t, 3.0, 4.8));            // rise and drift away
+    const aL = ease(seg(t, 3.0, 4.0));           // turn to the moon (faster than the move)
     const b = ease(seg(t, 4.3, 6.0));            // tilt down + zoom into the reflection
     pos = p1.clone().lerp(camTop, a);
     const lookMoonish = moonLook.clone().lerp(new THREE.Vector3(moonLook.x, 40, moonLook.z), 0.5); // keep moon low in frame
-    look = l1.clone().lerp(lookMoonish, a).lerp(reflAt, b);
+    look = l1.clone().lerp(lookMoonish, aL).lerp(reflAt, b);
     fov = lerp(62, 56, a);
     fov = lerp(fov, 17, b);
   }
