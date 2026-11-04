@@ -1,0 +1,504 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: #000; }
+  #gl { position: absolute; left: -99999px; top: 0; }
+  #out { display: block; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="out" width="1080" height="1920"></canvas>
+<canvas id="gl" width="1080" height="1920"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { Water } from 'three/addons/objects/Water.js';
+
+// Timeline
+//  0.0-2.5  cold open: black -> two nav lights -> ship at water level, slow dolly forward
+//  2.5-5.0  rise & drift away, low full moon, one continuous push into its reflection
+//  5.0-7.5  reflection -> expanding halo, ripples, water -> dark blue gradient, sparkles drift up
+//  7.5-10   static clean background (centre open for overlays, top/bottom 250 px free)
+
+const W = 1080, H = 1920, CX = W / 2, CY = H / 2;
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const ease = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const easeOut = x => 1 - Math.pow(1 - x, 3);
+function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+const R = rng(11);
+
+// ================= RENDERER / SCENE =================
+const glCanvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const BASE_EXPOSURE = 1.05;
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x0a1222, 0.0016);
+const camera = new THREE.PerspectiveCamera(62, W / H, 0.3, 12000);
+camera.layers.enable(1);
+
+const MOON_DIR = new THREE.Vector3(0.8, 0.17, -1).normalize();   // ~7.5 deg above the horizon
+
+// ---- night sky dome (manual exposure since it is not tone mapped) ----
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: { moonDir: { value: MOON_DIR }, bright: { value: 1 } },
+  vertexShader: `varying vec3 vDir; void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform vec3 moonDir; uniform float bright; varying vec3 vDir;
+    void main(){
+      float h = clamp(vDir.y, -0.1, 1.0);
+      vec3 top = vec3(0.006, 0.012, 0.035);
+      vec3 hor = vec3(0.045, 0.075, 0.14);
+      vec3 col = mix(hor, top, pow(clamp(h*2.2,0.0,1.0), 0.6));
+      float m = max(dot(normalize(vDir), moonDir), 0.0);
+      col += vec3(0.13,0.15,0.20) * pow(m, 18.0) + vec3(0.05,0.06,0.08) * pow(m, 4.0);
+      gl_FragColor = vec4(col * bright, 1.0);
+    }`
+});
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(6000, 48, 24), skyMat));
+
+// ---- stars ----
+{
+  const n = 1400, pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = R(), v = 0.03 + R() * 0.97;
+    const th = u * Math.PI * 2, y = v, r = Math.sqrt(1 - y * y);
+    pos.set([Math.cos(th) * r * 5500, y * 5500, Math.sin(th) * r * 5500], i * 3);
+    const b = 0.25 + Math.pow(R(), 3) * 0.9;
+    col.set([b * 0.9, b * 0.95, b], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 2.2, sizeAttenuation: false, vertexColors: true, fog: false, transparent: true, depthWrite: false })));
+}
+
+// ---- moon (kept out of the planar mirror so its reflection is a glitter path) ----
+function moonTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(230, 230, 20, 256, 256, 256);
+  g.addColorStop(0, '#fbfbf6'); g.addColorStop(0.85, '#e6e6de'); g.addColorStop(1, '#cfd0c8');
+  x.fillStyle = g; x.beginPath(); x.arc(256, 256, 256, 0, 7); x.fill();
+  const r = rng(5);
+  for (const [mx, my, mr] of [[190, 170, 90], [300, 210, 70], [250, 320, 80], [150, 290, 50], [340, 330, 45]]) {
+    const mg = x.createRadialGradient(mx, my, 0, mx, my, mr);
+    mg.addColorStop(0, 'rgba(120,124,130,0.45)'); mg.addColorStop(1, 'rgba(120,124,130,0)');
+    x.fillStyle = mg; x.beginPath(); x.arc(mx, my, mr, 0, 7); x.fill();
+  }
+  for (let i = 0; i < 220; i++) {
+    const a = r() * 6.28, d = Math.sqrt(r()) * 240, cr = 1 + Math.pow(r(), 3) * 14;
+    x.fillStyle = `rgba(100,100,105,${0.08 + r() * 0.15})`;
+    x.beginPath(); x.arc(256 + Math.cos(a) * d, 256 + Math.sin(a) * d, cr, 0, 7); x.fill();
+  }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const moonPos = MOON_DIR.clone().multiplyScalar(5000);
+const moon = new THREE.Mesh(new THREE.CircleGeometry(105, 64),
+  new THREE.MeshBasicMaterial({ map: moonTexture(), fog: false, toneMapped: false, color: new THREE.Color(1.6, 1.6, 1.55) }));
+moon.position.copy(moonPos); moon.lookAt(0, 0, 0); moon.layers.set(1); scene.add(moon);
+function glowTex() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.2, 'rgba(200,215,255,0.5)');
+  g.addColorStop(0.5, 'rgba(150,170,230,0.12)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+const glowT = glowTex();
+const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowT, blending: THREE.AdditiveBlending, fog: false, depthWrite: false, transparent: true, opacity: 0.6, toneMapped: false }));
+halo.scale.set(1200, 1200, 1); halo.position.copy(moonPos.clone().multiplyScalar(0.99)); halo.layers.set(1); scene.add(halo);
+
+// ---- lights ----
+const moonLight = new THREE.DirectionalLight(0xb9c8ff, 1.4);
+moonLight.position.copy(MOON_DIR.clone().multiplyScalar(100)); scene.add(moonLight);
+const fill = new THREE.DirectionalLight(0x7d8fbf, 0.9); fill.position.set(-30, 25, 80); scene.add(fill);
+scene.add(new THREE.HemisphereLight(0x22355e, 0x020306, 0.6));
+
+// ---- water ----
+const waterNormals = await new THREE.TextureLoader().loadAsync('waternormals.jpg');
+waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
+const water = new Water(new THREE.PlaneGeometry(20000, 20000), {
+  textureWidth: 1024, textureHeight: 1024, waterNormals,
+  sunDirection: MOON_DIR.clone(), sunColor: 0xc8d6ff, waterColor: 0x030b18,
+  distortionScale: 4.0, fog: true
+});
+water.rotation.x = -Math.PI / 2;
+water.material.fragmentShader = water.material.fragmentShader
+  .replace('uniform float size;', 'uniform float size;\nuniform float rough;')
+  .replace('noise.xzy * vec3( 1.5, 1.0, 1.5 )', 'noise.xzy * vec3( 1.5 * rough, 1.0, 1.5 * rough )')
+  .replace('sunColor * diffuseLight * 0.3', 'sunColor * diffuseLight * 0.02')
+  .replace('vec3( 0.1 ) + reflectionSample * 0.9 + reflectionSample * specularLight', 'vec3( 0.004 ) + reflectionSample * 0.8 + specularLight')
+  .replace('sunLight( surfaceNormal, eyeDirection, 100.0, 2.0, 0.5,', 'sunLight( surfaceNormal, eyeDirection, 260.0, 2.4, 0.5,');
+if (!water.material.fragmentShader.includes('1.5 * rough') || !water.material.fragmentShader.includes('260.0') || !water.material.fragmentShader.includes('0.004'))
+  throw new Error('water shader patch failed');
+water.material.uniforms.rough = { value: 1.0 };
+water.material.needsUpdate = true;
+scene.add(water);
+
+// ================= SHIP (no flags, no markings) =================
+const ship = new THREE.Group();
+scene.add(ship);
+const M = (c, o = {}) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: 0.6, metalness: 0.15 }, o));
+const hullWhite = M(0xb9bec4), hullDark = M(0x1c2a3a, { roughness: 0.5 }), deckGray = M(0x8b9096), black = M(0x111214);
+
+function hullShape(s = 1) {
+  const sh = new THREE.Shape();
+  sh.moveTo(-23 * s, -3.5 * s); sh.lineTo(13 * s, -4 * s);
+  sh.quadraticCurveTo(21 * s, -3.7 * s, 24.5 * s, 0);
+  sh.quadraticCurveTo(21 * s, 3.7 * s, 13 * s, 4 * s);
+  sh.lineTo(-23 * s, 3.5 * s);
+  sh.quadraticCurveTo(-24.3 * s, 0, -23 * s, -3.5 * s);
+  return sh;
+}
+function extrudeUp(shape, y0, h, mat) {
+  const g = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false, curveSegments: 24 });
+  g.rotateX(-Math.PI / 2); g.translate(0, y0, 0);
+  const m = new THREE.Mesh(g, mat); ship.add(m); return m;
+}
+extrudeUp(hullShape(), -2.5, 3.0, hullDark);
+extrudeUp(hullShape(), 0.5, 3.8, hullWhite);
+extrudeUp(hullShape(0.985), 4.3, 0.15, deckGray);
+// portholes (very few lit)
+{
+  const mk = lit => {
+    const c = document.createElement('canvas'); c.width = 2048; c.height = 64;
+    const x = c.getContext('2d'); const r = rng(21);
+    x.fillStyle = lit ? '#000' : '#b9bec4'; x.fillRect(0, 0, 2048, 64);
+    for (let i = 40; i < 1950; i += 26) { const on = r() < 0.06; x.fillStyle = lit ? (on ? '#ffcf8a' : '#000') : '#20252b'; x.beginPath(); x.arc(i, 32, 7, 0, 7); x.fill(); }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  };
+  const m = new THREE.MeshStandardMaterial({ map: mk(false), emissive: 0xffffff, emissiveMap: mk(true), emissiveIntensity: 0.7, roughness: .6, metalness: .1 });
+  for (const side of [1, -1]) {
+    const p = new THREE.Mesh(new THREE.PlaneGeometry(36, 1.1), m);
+    p.position.set(-4, 2.3, side * 3.78); if (side < 0) p.rotation.y = Math.PI; ship.add(p);
+  }
+}
+function windowTex(len, seed, litP) {
+  const c = document.createElement('canvas'); c.width = Math.round(len * 48); c.height = 128;
+  const e = document.createElement('canvas'); e.width = c.width; e.height = 128;
+  const x = c.getContext('2d'), y = e.getContext('2d');
+  x.fillStyle = '#c4c8cd'; x.fillRect(0, 0, c.width, 128);
+  y.fillStyle = '#000'; y.fillRect(0, 0, c.width, 128);
+  const r = rng(seed);
+  const ww = 30, gap = 12, wh = 46, top = 34;
+  for (let i = 14; i + ww < c.width - 10; i += ww + gap) {
+    const lit = r() < litP;
+    x.fillStyle = '#0b1118'; x.fillRect(i, top, ww, wh);
+    if (lit) { const k = 0.5 + r() * 0.4; y.fillStyle = `rgba(255,${190 + r() * 30},${120 + r() * 40},${k})`; y.fillRect(i, top, ww, wh); }
+  }
+  x.fillStyle = '#9ea4ab'; x.fillRect(0, 118, c.width, 10);
+  const map = new THREE.CanvasTexture(c), em = new THREE.CanvasTexture(e);
+  map.colorSpace = em.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.MeshStandardMaterial({ map, emissive: 0xffffff, emissiveMap: em, emissiveIntensity: 1.1, roughness: 0.55, metalness: 0.1 });
+}
+function deck(x0, x1, beam, y0, h, seed, litP) {
+  const len = x1 - x0;
+  const side = windowTex(len, seed, litP), end = windowTex(beam, seed + 1, litP * 0.6);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(len, h, beam), [end, end, hullWhite, hullWhite, side, side]);
+  m.position.set((x0 + x1) / 2, y0 + h / 2, 0); ship.add(m); return m;
+}
+deck(-18, 15, 7.6, 4.45, 2.2, 31, 0.10);
+deck(-15, 12.5, 7.3, 6.65, 2.1, 41, 0.07);
+deck(-9, 11.5, 7.0, 8.75, 2.0, 51, 0.05);
+{ const b = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.5, 9.4), hullWhite); b.position.set(10.3, 10.5, 0); ship.add(b); }
+{ const b = new THREE.Mesh(new THREE.BoxGeometry(21, 0.25, 7.4), deckGray); b.position.set(1.2, 10.85, 0); ship.add(b); }
+for (const lvl of [6.65, 8.75]) for (const side of [1, -1]) {
+  const r = new THREE.Mesh(new THREE.BoxGeometry(29, 0.08, 0.08), hullWhite); r.position.set(-1.5, lvl + 1.0, side * 3.9); ship.add(r);
+}
+for (let i = 0; i < 5; i++) {
+  const lb = new THREE.Mesh(new THREE.CapsuleGeometry(0.55, 2.6, 4, 10), M(0x9c4a20, { roughness: 0.8 }));
+  lb.rotation.z = Math.PI / 2; lb.scale.set(1, 1, 0.85);
+  lb.position.set(-11 + i * 4.8, 8.05, 4.05); ship.add(lb);
+}
+{
+  const f = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.8, 4.6, 24), hullWhite);
+  f.scale.set(1.3, 1, 0.85); f.position.set(-5, 13.1, 0); f.rotation.z = 0.12; ship.add(f);
+  const top = new THREE.Mesh(new THREE.CylinderGeometry(1.52, 1.52, 0.9, 24), black);
+  top.scale.set(1.3, 1, 0.85); top.position.set(-5.3, 15.2, 0); top.rotation.z = 0.12; ship.add(top);
+}
+{
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 6, 8), hullWhite); mast.position.set(8, 13.9, 0); ship.add(mast);
+  const yard = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 3.2), hullWhite); yard.position.set(8, 15.3, 0); ship.add(yard);
+  const radar = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.25, 2.6), black); radar.position.set(8.4, 12.2, 0); ship.add(radar);
+}
+
+// lights: nav lights are untouched by exposure so they can glow out of the black first
+const navMats = [];
+function bulb(x, y, z, color, size, nav = false, light = 0) {
+  const sm = new THREE.SpriteMaterial({ map: glowT, color, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, toneMapped: !nav });
+  const s = new THREE.Sprite(sm); s.position.set(x, y, z); s.scale.set(size, size, 1); ship.add(s);
+  const cm = new THREE.MeshBasicMaterial({ color, toneMapped: !nav, transparent: nav });
+  const core = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 6), cm); core.position.set(x, y, z); ship.add(core);
+  if (nav) navMats.push(sm, cm);
+  if (light) { const pl = new THREE.PointLight(color, light, 14, 2); pl.position.set(x, y, z); ship.add(pl); }
+}
+bulb(8, 16.95, 0, 0xffffff, 2.6, true);      // masthead (white)
+bulb(10.4, 10.9, 4.7, 0x33ff77, 2.2, true);  // starboard (green)
+bulb(10.4, 10.9, -4.7, 0xff2a2a, 1.8);       // port (red, far side)
+bulb(-23.2, 5.0, 0, 0xffffff, 1.4);          // stern light
+bulb(-12, 6.4, 3.95, 0xffc98a, 1.0, false, 5);
+bulb(0.5, 6.4, 3.95, 0xffc98a, 0.9);
+bulb(-3, 10.5, 3.6, 0xffc98a, 0.7);
+
+// foam along the hull and wake
+function foamTex(seed) {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 128;
+  const x = c.getContext('2d'); const r = rng(seed);
+  for (let i = 0; i < 2600; i++) {
+    const px = r() * 512, py = 64 + (r() - .5) * 120 * Math.pow(r(), 0.6);
+    const a = (1 - Math.abs(py - 64) / 64) * (0.12 + r() * 0.3);
+    x.fillStyle = `rgba(235,242,255,${a})`; x.beginPath(); x.ellipse(px, py, 1 + r() * 6, 0.6 + r() * 2, 0, 0, 7); x.fill();
+  }
+  const t = new THREE.CanvasTexture(c); t.wrapS = THREE.RepeatWrapping; return t;
+}
+const foamMats = [];
+function foamStrip(len, wid, x, z, rotY, seed, op) {
+  const m = new THREE.MeshBasicMaterial({ map: foamTex(seed), transparent: true, opacity: op, depthWrite: false, color: 0x8fa3c4 });
+  const p = new THREE.Mesh(new THREE.PlaneGeometry(len, wid), m);
+  p.rotation.x = -Math.PI / 2; p.rotation.z = rotY; p.position.set(x, 0.06, z); ship.add(p); foamMats.push(m);
+}
+foamStrip(40, 1.6, -2, 4.05, 0, 3, 0.7);
+foamStrip(40, 1.6, -2, -4.05, 0, 4, 0.7);
+foamStrip(9, 2.6, 21, 2.9, -0.45, 5, 0.85);
+foamStrip(9, 2.6, 21, -2.9, 0.45, 6, 0.85);
+foamStrip(70, 9, -58, 0, 0, 7, 0.4);
+
+// ================= 2D COMPOSITING =================
+const out = document.getElementById('out');
+const o = out.getContext('2d', { willReadFrequently: true });
+
+// static end background: clean dark-blue gradient, soft centre glow, kept free of key content
+const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+{
+  const c = bg.getContext('2d');
+  const g = c.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#030918'); g.addColorStop(0.5, '#0b2350'); g.addColorStop(1, '#030918');
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+  const d = c.createLinearGradient(0, 0, W, H);
+  d.addColorStop(0, 'rgba(20,70,110,0.0)'); d.addColorStop(0.5, 'rgba(30,90,140,0.10)'); d.addColorStop(1, 'rgba(20,70,110,0.0)');
+  c.fillStyle = d; c.fillRect(0, 0, W, H);
+  const cg = c.createRadialGradient(CX, CY, 0, CX, CY, 720);
+  cg.addColorStop(0, 'rgba(70,150,210,0.20)'); cg.addColorStop(0.5, 'rgba(50,120,190,0.08)'); cg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = cg; c.fillRect(0, 0, W, H);
+}
+
+const stars = [];
+{ const r = rng(77);
+  for (let i = 0; i < 150; i++) stars.push({ x: r() * W, y: r() * H, s: 0.6 + Math.pow(r(), 2) * 1.8, ph: r() * 6.28, sp: 0.6 + r() * 1.6, four: false });
+  // a few larger 4-point sparkles, away from the centre and outside the top/bottom 250 px
+  for (const [x, y, s] of [[130, 420, 16], [950, 520, 22], [900, 1380, 14], [170, 1500, 18], [990, 900, 9], [80, 1080, 8], [760, 330, 8], [320, 1620, 9]])
+    stars.push({ x, y, s, ph: r() * 6.28, sp: 0.8 + r(), four: true });
+}
+const motes = [];
+{ const r = rng(91);
+  for (let i = 0; i < 90; i++) motes.push({
+    x0: CX + (r() - 0.5) * 1000, y0: CY + (r() - 0.25) * 900, t0: 5.15 + r() * 1.5,
+    vy: -(60 + r() * 170), sway: 8 + r() * 26, ph: r() * 6.28, s: 1 + r() * 3.2, life: 1.8 + r() * 1.4, four: r() < 0.25
+  });
+}
+function star4(c, x, y, s, a) {
+  if (a <= 0.01) return;
+  c.save(); c.globalAlpha = a; c.translate(x, y);
+  const g = c.createRadialGradient(0, 0, 0, 0, 0, s * 1.7);
+  g.addColorStop(0, 'rgba(210,240,255,0.45)'); g.addColorStop(1, 'rgba(160,220,255,0)');
+  c.fillStyle = g; c.beginPath(); c.arc(0, 0, s * 1.7, 0, 7); c.fill();
+  c.fillStyle = 'rgba(232,248,255,0.95)'; const k = s * 0.16;
+  c.beginPath(); c.moveTo(0, -s); c.quadraticCurveTo(k, -k, s, 0); c.quadraticCurveTo(k, k, 0, s);
+  c.quadraticCurveTo(-k, k, -s, 0); c.quadraticCurveTo(-k, -k, 0, -s); c.fill(); c.restore();
+}
+function dot(c, x, y, r, a) {
+  if (a <= 0.01) return;
+  c.globalAlpha = a; c.fillStyle = '#e6f4ff';
+  c.beginPath(); c.arc(x, y, r, 0, 7); c.fill(); c.globalAlpha = 1;
+}
+
+// bloom buffers
+const bw = 270, bh = 480;
+const b1 = document.createElement('canvas'); b1.width = bw; b1.height = bh;
+const b2 = document.createElement('canvas'); b2.width = bw; b2.height = bh;
+const b1c = b1.getContext('2d'), b2c = b2.getContext('2d');
+
+// grade tables: teal/navy shadows, teal mids, amber highlights, gentle S-curve
+const SW = new Float32Array(256), MW = new Float32Array(256), HW = new Float32Array(256), CURVE = new Uint8ClampedArray(256);
+for (let i = 0; i < 256; i++) {
+  const l = i / 255;
+  SW[i] = 0.55 * Math.pow(1 - l, 2.2);
+  MW[i] = 0.40 * Math.exp(-Math.pow((l - 0.45) / 0.2, 2));
+  HW[i] = 0.58 * clamp((l - 0.5) / 0.45) ** 1.4;
+  const s = l < 0.5 ? 0.5 * Math.pow(2 * l, 1.12) : 1 - 0.5 * Math.pow(2 * (1 - l), 1.12);
+  CURVE[i] = Math.round(255 * (0.012 + 0.988 * s));
+}
+const SH = [0.62, 0.92, 1.38], MID = [0.72, 1.08, 1.12], HI = [1.32, 1.02, 0.66];
+
+function postProcess(t) {
+  // lens bloom: bright-pass on a small copy, blur, add back
+  b1c.filter = 'brightness(0.7) contrast(3.2)';
+  b1c.clearRect(0, 0, bw, bh); b1c.drawImage(out, 0, 0, bw, bh); b1c.filter = 'none';
+  b2c.filter = 'blur(9px)'; b2c.clearRect(0, 0, bw, bh); b2c.drawImage(b1, 0, 0); b2c.filter = 'none';
+  o.save(); o.globalCompositeOperation = 'lighter'; o.globalAlpha = 0.38; o.imageSmoothingQuality = 'high';
+  o.drawImage(b2, 0, 0, W, H); o.restore();
+
+  // vignette
+  const vg = o.createRadialGradient(CX, CY * 0.98, H * 0.3, CX, CY, H * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.42)');
+  o.fillStyle = vg; o.fillRect(0, 0, W, H);
+
+  // split-tone grade + film grain
+  const img = o.getImageData(0, 0, W, H), d = img.data;
+  let s = (Math.floor(t * 30) * 2654435761) >>> 0;
+  const grainAmt = 9 * clamp(t / 0.35);
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const l = (54 * r + 183 * g + 19 * b) >> 8;
+    const sw = SW[l], mw = MW[l], hw = HW[l], wt = sw + mw + hw;
+    let nr = r * (1 - wt) + l * (sw * SH[0] + mw * MID[0] + hw * HI[0]);
+    let ng = g * (1 - wt) + l * (sw * SH[1] + mw * MID[1] + hw * HI[1]);
+    let nb = b * (1 - wt) + l * (sw * SH[2] + mw * MID[2] + hw * HI[2]);
+    s = (s * 1664525 + 1013904223) >>> 0;
+    const n = ((s >>> 24) - 128) / 128 * grainAmt * (0.35 + 0.65 * Math.sin(Math.PI * Math.min(1, l / 200)));
+    d[i] = CURVE[nr + n < 0 ? 0 : nr + n > 255 ? 255 : (nr + n) | 0];
+    d[i + 1] = CURVE[ng + n < 0 ? 0 : ng + n > 255 ? 255 : (ng + n) | 0];
+    d[i + 2] = CURVE[nb + n < 0 ? 0 : nb + n > 255 ? 255 : (nb + n) | 0];
+  }
+  o.putImageData(img, 0, 0);
+}
+
+// ================= CAMERA / TIMELINE =================
+const shipX = t => -14 + 3.0 * t;
+function shake(t) {
+  return [Math.sin(t * 1.7) * 0.5 + Math.sin(t * 2.9 + 1) * 0.3, Math.sin(t * 1.3 + 2) * 0.5 + Math.sin(t * 3.7) * 0.2];
+}
+
+function render3D(t) {
+  const sx = shipX(t);
+  ship.position.set(sx, Math.sin(t * 0.9) * 0.12, 0);
+  ship.rotation.set(Math.sin(t * 0.8 + 1) * 0.012, 0, Math.sin(t * 0.6) * 0.008);
+  for (const m of foamMats) m.map.offset.x = -t * 0.1;
+
+  // cold open: everything rises out of black, nav lights first
+  const expo = BASE_EXPOSURE * Math.pow(ease(seg(t, 0.55, 2.2)), 1.3) * lerp(1, 0.42, ease(seg(t, 3.6, 5.0)));
+  renderer.toneMappingExposure = Math.max(expo, 0.0001);
+  skyMat.uniforms.bright.value = expo / BASE_EXPOSURE;
+  const navA = 0.85 * easeOut(seg(t, 0.12, 0.9));
+  for (const m of navMats) m.opacity = navA;
+
+  const calm = ease(seg(t, 2.5, 4.4));
+  water.material.uniforms.time.value = t * 0.75;
+  water.material.uniforms.distortionScale.value = lerp(4.2, 1.6, calm);
+  water.material.uniforms.size.value = lerp(1.6, 2.4, calm);
+  water.material.uniforms.rough.value = lerp(1.0, 0.36, calm);
+
+  const [hx, hy] = shake(t);
+  // scene 1: water level, slow dolly forward while the ship slides across
+  const dz = lerp(58, 47, ease(seg(t, 0, 2.6)) * 0.6 + seg(t, 0, 2.6) * 0.4);
+  const p1 = new THREE.Vector3(-12.5, 1.3 + Math.sin(t * 1.1) * 0.2 + hy * 0.1, dz);
+  const l1 = new THREE.Vector3(-11, 6.4 + hy * 0.08, 0);
+  // scene 2: rise & drift away, turn to the low moon, push into its reflection in one move
+  const camTop = new THREE.Vector3(sx + 26, 12, 62);
+  const flat = new THREE.Vector3(MOON_DIR.x, 0, MOON_DIR.z).normalize();
+  const reflAt = camTop.clone().add(flat.clone().multiplyScalar(100)); reflAt.y = 0;
+  const moonLook = camTop.clone().add(MOON_DIR.clone().multiplyScalar(300));
+  moonLook.y = lerp(moonLook.y, camTop.y + 300 * 0.06, 0.5);
+  let pos, look, fov;
+  if (t < 2.5) { pos = p1; look = l1; fov = 60; }
+  else {
+    const a = ease(seg(t, 2.5, 4.3));
+    const aL = ease(seg(t, 2.5, 3.5));
+    const b = ease(seg(t, 3.55, 5.0));
+    pos = p1.clone().lerp(camTop, a);
+    look = l1.clone().lerp(moonLook, aL).lerp(reflAt, b);
+    fov = lerp(60, 54, aL);
+    fov = lerp(fov, 12, b);
+    if (t > 5.0) fov = lerp(12, 9, ease(seg(t, 5.0, 6.6)));
+  }
+  look.x += hx * 0.22; look.y += hy * 0.12;
+  camera.position.copy(pos);
+  camera.fov = fov; camera.updateProjectionMatrix();
+  camera.up.set(Math.sin(t * 0.7) * 0.006, 1, 0);
+  camera.lookAt(look);
+  renderer.render(scene, camera);
+}
+
+window.renderFrame = function (t) {
+  o.globalAlpha = 1; o.globalCompositeOperation = 'source-over'; o.filter = 'none';
+  o.fillStyle = '#000'; o.fillRect(0, 0, W, H);
+
+  const glA = 1 - ease(seg(t, 5.25, 6.7));
+  if (glA > 0) render3D(t);
+
+  if (t >= 5.0) {
+    // background settles frontally
+    const z = lerp(1.04, 1.0, easeOut(seg(t, 5.6, 7.5)));
+    o.save(); o.translate(CX, CY); o.scale(z, z); o.translate(-CX, -CY); o.drawImage(bg, 0, 0); o.restore();
+  }
+  if (glA > 0) { o.globalAlpha = glA; o.drawImage(glCanvas, 0, 0); o.globalAlpha = 1; }
+
+  if (t >= 5.0 && t < 7.8) {
+    o.save(); o.globalCompositeOperation = 'lighter';
+    // the reflection becomes a soft circular halo that expands, blooms and opens up in the middle
+    const I = easeOut(seg(t, 5.0, 5.4)) * (1 - ease(seg(t, 5.5, 7.4)));
+    const hollow = ease(seg(t, 5.35, 6.5));
+    const Rr = 90 + 1450 * easeOut(seg(t, 5.0, 7.3));
+    if (I > 0.002) {
+      const g = o.createRadialGradient(CX, CY, 0, CX, CY, Rr);
+      g.addColorStop(0, `rgba(255,222,176,${0.42 * I * (1 - hollow)})`);
+      g.addColorStop(0.35, `rgba(190,215,250,${0.24 * I * (1 - 0.85 * hollow)})`);
+      g.addColorStop(0.72, `rgba(110,180,235,${0.30 * I})`);
+      g.addColorStop(0.86, `rgba(80,150,220,${0.12 * I})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      o.fillStyle = g; o.fillRect(0, 0, W, H);
+    }
+    // light ripples fanning outward from the centre
+    for (const ts of [5.1, 5.38, 5.66, 5.94, 6.22]) {
+      const age = t - ts; if (age <= 0 || age > 1.5) continue;
+      const rr = 50 + age * 640;
+      const a = 0.5 * Math.pow(1 - age / 1.5, 1.6) * easeOut(seg(age, 0, 0.12));
+      o.strokeStyle = `rgba(185,225,255,${a})`;
+      o.lineWidth = 3 + age * 5;
+      o.shadowColor = `rgba(150,210,255,${a})`; o.shadowBlur = 22;
+      o.beginPath(); o.arc(CX, CY, rr, 0, 7); o.stroke();
+    }
+    o.restore();
+  }
+
+  if (t >= 5.0) {
+    // sparkle particles drifting upward
+    for (const m of motes) {
+      const age = t - m.t0; if (age < 0 || age > m.life) continue;
+      const p = age / m.life;
+      const a = Math.sin(Math.PI * p) * 0.9 * (1 - seg(t, 7.6, 8.6));
+      const x = m.x0 + Math.sin(age * 1.8 + m.ph) * m.sway, y = m.y0 + m.vy * age;
+      if (m.four) star4(o, x, y, m.s * 2.4, a); else dot(o, x, y, m.s * 0.8, a);
+    }
+    // subtle sparkle stars of the end frame
+    const sa = ease(seg(t, 5.9, 7.5));
+    for (const s of stars) {
+      const tw = 0.72 + 0.28 * Math.sin(t * s.sp + s.ph);
+      if (s.four) star4(o, s.x, s.y, s.s * (0.9 + 0.1 * tw), sa * tw * 0.85);
+      else dot(o, s.x, s.y, s.s, sa * tw * 0.75);
+    }
+  }
+
+  postProcess(t);
+};
+
+window.ready = Promise.resolve(true);
+</script>
+</body>
+</html>
