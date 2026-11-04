@@ -15,6 +15,6 @@ G=$(python3 -c "print(-15.0-($I))")
 ffmpeg -y -loglevel error -i "$WORK/raw.wav" -af "volume=${G}dB,alimiter=limit=0.89:level=false" -ar 48000 "$WORK/sound.wav"
 
 ffmpeg -y -framerate 30 -i "$WORK/frames/f_%04d.png" -i "$WORK/sound.wav" \
-  -c:v libx264 -preset slow -crf 17 -pix_fmt yuv420p -profile:v high -movflags +faststart \
+  -c:v libx264 -preset slow -crf 19 -maxrate 14M -bufsize 28M -tune grain -pix_fmt yuv420p -profile:v high -movflags +faststart \
   -c:a aac -b:a 192k -ar 48000 -shortest \
   storytelling-night-reel.mp4
